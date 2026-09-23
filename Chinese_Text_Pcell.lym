@@ -1,0 +1,232 @@
+<?xml version="1.0" encoding="utf-8"?>
+<klayout-macro>
+ <description>ChineseText PCell 库：把中文文本按系统字体轮廓转成多边形（参考 KLayout 内置 Basic TEXT PCell 的接口设计，字形来源改用 Qt 字体引擎，绕开 TextGenerator 仅支持 ASCII 32-127 的限制）</description>
+ <version>1.0</version>
+ <format>general</format>
+ <autorun>true</autorun>
+ <autorun-early>false</autorun-early>
+ <show-in-menu>false</show-in-menu>
+ <shortcut></shortcut>
+ <interpreter>python</interpreter>
+ <text><![CDATA[
+# ChineseText PCell library
+#
+# 参考:
+#   - KLayout 内置 TEXT PCell: src/lib/lib/libBasicText.cc (接口设计: produce/参数声明)
+#   - KLayout 字形机制: src/db/db/dbGlyphs.cc (TextGenerator, 仅 ASCII)
+# 本实现改用 KLayout 自带的 Qt 绑定 (pya.QFont / pya.QPainterPath) 渲染系统字体
+# (SimHei / Microsoft YaHei 等), 因此可直接支持中文。
+#
+# 用法: 将本文件放入 KLayout 的 macros 目录 (或用宏编辑器导入),
+# 重启 KLayout 后在 PCell 库列表中选择 "ChineseText" -> CHINESE_TEXT。
+# 注意: 仅在 GUI 模式可用 (需要 Qt); 字形随系统字体, 发布版图前请确认目标机器字体一致。
+
+import pya
+
+# KLayout 的 Qt 绑定在不同版本间方法命名不一致 (camelCase / snake_case),
+# 这里做统一解析, 提高兼容性。
+def _method(obj, *names):
+    for n in names:
+        fn = getattr(obj, n, None)
+        if fn is not None:
+            return fn
+    raise AttributeError("Qt 绑定中找不到以下任何一个方法: %s" % ", ".join(names))
+
+
+# --------------------------------------------------------------------------
+# 字形布尔合成 (移植自 chinese_text_pcell.lym 的已验证方案):
+# toFillPolygons 会把外轮廓和内孔用零宽缝连成"钥匙孔"轮廓, 渲染出多余的斜线;
+# 改为逐子路径取轮廓, 用偶奇(XOR)布尔消解重叠与孔, 再把带孔多边形切成无孔简单多边形
+# --------------------------------------------------------------------------
+_BIG = 10 ** 9
+_MAX_SPLIT_DEPTH = 64
+_GLYPH_CACHE = {}    # (font, bold, italic, ch) -> [pya.Polygon(dbu 坐标, 无孔)]
+
+
+def _poly_area(pts):
+    s = 0.0
+    n = len(pts)
+    for i in range(n):
+        x1, y1 = pts[i].x, pts[i].y
+        x2, y2 = pts[(i + 1) % n].x, pts[(i + 1) % n].y
+        s += x1 * y2 - x2 * y1
+    return 0.5 * s
+
+
+def _hole_rings(poly):
+    rings = []
+    for h in range(poly.holes()):
+        pts = [(pt.x, pt.y) for pt in poly.each_point_hole(h)]
+        if len(pts) >= 3:
+            rings.append(pts)
+    return rings
+
+
+def _dup_polygon(poly):
+    out = pya.Polygon([pya.Point(pt.x, pt.y) for pt in poly.each_point_hull()])
+    for ring in _hole_rings(poly):
+        out.insert_hole([pya.Point(x, y) for x, y in ring])
+    return out
+
+
+def _split_polygon(poly, out, depth=0):
+    """递归把带孔多边形切成无孔简单多边形 (沿孔的 y 中线横切)."""
+    holes = _hole_rings(poly)
+    dup = _dup_polygon(poly)
+    if not holes or depth > _MAX_SPLIT_DEPTH:
+        out.append(dup)
+        return
+    ys = [pt[1] for ring in holes for pt in ring]
+    base = (min(ys) + max(ys)) // 2
+    single = pya.Region(dup)
+    area0 = single.area()
+    tol = max(16, abs(area0) // 10000)
+    for off in (0, 1, -1, 2, -2, 3, -3, 5, -5, 8, -8, 13, -13):
+        yc = base + off
+        top = single & pya.Box(-_BIG, yc, _BIG, _BIG)
+        bot = single & pya.Box(-_BIG, -_BIG, _BIG, yc)
+        if abs(top.area() + bot.area() - area0) > tol:
+            continue
+        pieces = []
+        for part in (top, bot):
+            for q in part.each():
+                pieces.append(_dup_polygon(q))
+        for q in pieces:
+            if len(_hole_rings(q)) == 0:
+                out.append(q)
+            elif len(_hole_rings(q)) < len(holes):
+                _split_polygon(q, out, depth + 1)
+            else:
+                out.append(q)
+        return
+    out.append(_dup_polygon(poly))
+
+
+class ChineseTextPCell(pya.PCellDeclarationHelper):
+
+    def __init__(self):
+        super(ChineseTextPCell, self).__init__()
+        # 注意: pymod 的 param() 签名是 param(name, type, description, hidden=False,
+        # readonly=False, unit=None, default=None, ...), 默认值必须用关键字参数传,
+        # 位置传参会把默认值塞进 hidden -> 参数被隐藏且无默认值
+        self.param("text", self.TypeString, "文本 (支持 \\n 换行)", default="中文文本")
+        self.param("font_name", self.TypeString, "字体名 (如 SimHei/SimSun/Microsoft YaHei)", default="SimHei")
+        self.param("font_size", self.TypeDouble, "字号 (µm, 以 em 高度计)", default=10.0)
+        self.param("bold", self.TypeBoolean, "加粗", default=False)
+        self.param("italic", self.TypeBoolean, "斜体", default=False)
+        self.param("char_spacing", self.TypeDouble, "字间距 (µm)", default=0.0)
+        self.param("line_spacing", self.TypeDouble, "行距 (µm, 附加量)", default=0.0)
+        self.param("layer", self.TypeLayer, "图层", default=pya.LayerInfo(1, 0))
+
+    def display_text_impl(self):
+        # display_text 阶段参数可能是 None, 必须兜底; 且此函数调用频繁, 保持廉价
+        text = self.text or ""
+        return "%s '%s'" % (self.font_name, text.replace("\\n", "|"))
+
+    def coerce_parameters_impl(self):
+        # 用字典创建 PCell / 手动 produce 时参数可能是 None, 这里统一兜底
+        if self.text is None:
+            self.text = "中文文本"
+        if self.font_name is None or not self.font_name:
+            self.font_name = "SimHei"
+        if self.font_size is None or self.font_size <= 0:
+            self.font_size = 10.0
+        if self.char_spacing is None:
+            self.char_spacing = 0.0
+        if self.line_spacing is None:
+            self.line_spacing = 0.0
+        if self.layer is None:
+            self.layer = pya.LayerInfo(1, 0)
+        self.bold = bool(self.bold)
+        self.italic = bool(self.italic)
+
+    def produce_impl(self):
+        self.coerce_parameters_impl()
+        # 注意: 需要 Qt 绑定 (GUI 模式); 纯命令行 (-z) 下 QPainterPath 不可用
+        dbu = self.layout.dbu
+        inv = 1.0 / float(dbu)
+        em = 100.0                       # 用 100pt 的字号渲染, 再线性缩放, 保证精度
+        scale = self.font_size / em      # Qt 坐标 -> µm
+        # 用 setPixelSize 定义 em, 使路径坐标与 DPI/点-像素换算无关;
+        # 旧绑定没有 setPixelSize 时退回 setPointSizeF
+        font = pya.QFont(self.font_name)
+        try:
+            _method(font, "setPixelSize")(int(em))
+        except Exception:
+            _method(font, "setPointSizeF")(em)
+        try:
+            _method(font, "setBold")(bool(self.bold))
+            _method(font, "setItalic")(bool(self.italic))
+        except AttributeError:
+            pass
+        metrics = pya.QFontMetricsF(font)
+        _adv = _method(metrics, "horizontalAdvance", "width")
+        _h = _method(metrics, "height")
+        line_h = _h() + self.line_spacing / scale   # 行高 (Qt 坐标)
+        spacing_q = self.char_spacing / scale       # 字间距 (Qt 坐标)
+
+        def _coord(p, name):
+            v = getattr(p, name)
+            return v() if callable(v) else v
+
+        def _glyph_polys(ch):
+            """单字符 -> 无孔简单多边形列表 (dbu 坐标, 基线 y=0), 带缓存."""
+            key = (self.font_name, bool(self.bold), bool(self.italic), ch)
+            hit = _GLYPH_CACHE.get(key)
+            if hit is not None:
+                return hit
+            path = pya.QPainterPath()
+            _method(path, "addText")(0.0, 0.0, font, ch)
+            region = pya.Region()
+            for sub in _method(path, "toSubpathPolygons")():
+                ring = []
+                for p in sub:
+                    pt = pya.Point(int(round(_coord(p, "x") * scale * inv)),
+                                   -int(round(_coord(p, "y") * scale * inv)))
+                    if not ring or ring[-1] != pt:
+                        ring.append(pt)
+                while len(ring) > 1 and ring[0] == ring[-1]:
+                    ring.pop()
+                if len(ring) >= 3 and _poly_area(ring) != 0:
+                    region ^= pya.Region(pya.Polygon(ring))   # 偶奇合成: 重叠消解, 内孔成孔
+            out = []
+            for poly in region.each():
+                _split_polygon(poly, out)
+            _GLYPH_CACHE[key] = out
+            return out
+
+        shapes = self.cell.shapes(self.layer_layer)
+        y = 0.0
+        for line in self.text.split("\\n"):
+            x = 0.0
+            for ch in line:
+                if not ch.isspace():
+                    dx = int(round(x * scale * inv))
+                    dy = int(round(y * scale * inv))
+                    for poly in _glyph_polys(ch):
+                        shapes.insert(poly.moved(pya.Vector(dx, dy)))
+                x += _adv(ch) + spacing_q
+            y += line_h
+
+
+class ChineseTextLib(pya.Library):
+
+    def __init__(self):
+        self.description = "中文文本 PCell 库 (Qt 字体轮廓 -> 多边形)"
+        self.layout().register_pcell("CHINESE_TEXT", ChineseTextPCell())
+        self.register("ChineseText")
+
+
+# 重复执行(重新加载宏)时先注销旧实例, 否则会报库已注册
+_lookup = getattr(pya.Library, "library_by_name", None)
+if _lookup is not None:
+    try:
+        _old = _lookup("ChineseText")
+        if _old is not None:
+            _old.unregister()
+    except Exception:
+        pass
+
+ChineseTextLib()
+ ]]></text>
+</klayout-macro>
