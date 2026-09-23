@@ -1,0 +1,2 @@
+# Chinese_Text_Pcell_Klayout
+增加中文PCELL功能
